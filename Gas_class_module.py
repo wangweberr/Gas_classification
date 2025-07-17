@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 import pandas as pd
+import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
 class CrossAttention(nn.Module):
     def __init__(self, in_chans=18, embed_dim=256,num_heads=8, attn_drop=0):
@@ -17,6 +18,8 @@ class CrossAttention(nn.Module):
         q=x1.unsqueeze(1)#q的shape为(B,1,256)
         k=self.key_gen(x2).unsqueeze(0).repeat(x1.size(0),1,1)#k的shape为(B,24,256)       
         v=self.value_gen(x2).unsqueeze(0).repeat(x1.size(0),1,1)#v的shape为(B,24,256)
+        q = nn.functional.normalize(q, p=2, dim=-1)
+        k = nn.functional.normalize(k, p=2, dim=-1)
         attn_output,attn_weights=self.attention(q,k,v)#attn_output的shape为(B,1,256)，attn_weights的shape为(B,1,24)
         context_vector=attn_output.squeeze(1)
         #context_vector的shape为(B,256)，attn_weights的shape为(B,24)
@@ -82,12 +85,15 @@ class GasDatasplit():
         
         # 2. 加载主要的训练/测试数据 (这部分逻辑保持不变)
         data_df = pd.read_csv(data_csv_path)
-        data_df = data_df.sample(frac=0.3, random_state=42)
+        #data_df = data_df.sample(frac=0.7, random_state=42)
         self.x_input = data_df.iloc[:, :18].values.astype('float32')
         self.x_input=torch.tensor(self.x_input, dtype=torch.float32)
+        smoothing_filter = torch.ones(1, 1, 3, dtype=torch.float32) / 3.0
+        self.x_input = F.conv1d(self.x_input.unsqueeze(1), smoothing_filter, padding=1).squeeze(1)
+        self.x_input = torch.diff(self.x_input, dim=1)
+        self.x_input =F.normalize(self.x_input, p=2, dim=1)
         raw_labels = data_df.iloc[:, 18].values.astype(int)
         self.labels = torch.tensor(raw_labels - 1, dtype=torch.long)
-
         self.test_size=test_size
         self.val_size=val_size
         
@@ -100,7 +106,36 @@ class GasDatasplit():
         return train_dataset, val_dataset, test_dataset
 
         
+def get_gasbase(gasbase_csv_path):
+    # 1. 加载 Gasbase "知识库" (用于生成 K 和 V)
+    # pandas 会自动将第一行识别为表头
+    gasbase_df = pd.read_csv(gasbase_csv_path)
+        # 按 'gas_type' 列排序，以确保气体顺序正确
+    gasbase_df = gasbase_df.sort_values(by='gas_type')
+    # 提取特征部分 (通过列名丢弃 'gas_type' 列)
+    gasbase_features = gasbase_df.drop(columns=['gas_type']).values.astype('float32')
+    x_gasbase = torch.tensor(gasbase_features, dtype=torch.float32)
+    smoothing_filter = torch.ones(1, 1, 3, dtype=torch.float32) / 3.0
+    x_gasbase = F.conv1d(x_gasbase.unsqueeze(1), smoothing_filter, padding=1).squeeze(1)
+    x_gasbase = torch.diff(x_gasbase, dim=1)
+    x_gasbase = F.normalize(x_gasbase, p=2, dim=1)
+    return x_gasbase
+
+def calculate_accuracy(outputs, labels):
+    """
+    计算一个批次的正确预测数和总样本数。
     
+    参数:
+    outputs (torch.Tensor): 模型的原始输出 (logits)。
+    labels (torch.Tensor): 真实的标签。
+    
+    返回:
+    tuple: (正确预测的数量, 当前批次的总样本数)
+    """
+    _, predicted = torch.max(outputs.data, 1)
+    total = labels.size(0)
+    correct = (predicted == labels).sum().item()
+    return correct, total
 
 
         

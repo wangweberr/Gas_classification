@@ -2,53 +2,29 @@ import os
 import torch
 import torch.nn as nn
 import logging
-import time
+import torch.nn.functional as F
 import shutil
 from tqdm import tqdm
 import pandas as pd
-from Gas_class_module import Gas_class_module, GasDatasplit,Gas_Data, Classifer,CrossAttention
+from Gas_class_module import Gas_class_module, GasDatasplit,get_gasbase,calculate_accuracy
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR, CosineAnnealingWarmRestarts
 
 
 
-batch_size=16
-epochs=20
-patience=10
-data_csv_path='./data/simulation.csv'
+batch_size=20
+epochs=30
+patience=20
+attn_ratio=3
+data_csv_path='./data/simulation_less.csv'
 gasbase_csv_path='./data/Gasbase.csv'
+LR=3e-5
+W_D=1e-1
+DROP=0.3
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def calculate_accuracy(outputs, labels):
-    """
-    计算一个批次的正确预测数和总样本数。
-    
-    参数:
-    outputs (torch.Tensor): 模型的原始输出 (logits)。
-    labels (torch.Tensor): 真实的标签。
-    
-    返回:
-    tuple: (正确预测的数量, 当前批次的总样本数)
-    """
-    _, predicted = torch.max(outputs.data, 1)
-    total = labels.size(0)
-    correct = (predicted == labels).sum().item()
-    return correct, total
 
-def get_gasbase(gasbase_csv_path):
-    # 1. 加载 Gasbase "知识库" (用于生成 K 和 V)
-    # pandas 会自动将第一行识别为表头
-    gasbase_df = pd.read_csv(gasbase_csv_path)
-        # 按 'gas_type' 列排序，以确保气体顺序正确
-    gasbase_df = gasbase_df.sort_values(by='gas_type')
-    # 提取特征部分 (通过列名丢弃 'gas_type' 列)
-    gasbase_features = gasbase_df.drop(columns=['gas_type']).values.astype('float32')
-    x_gasbase = torch.tensor(gasbase_features, dtype=torch.float32)
-    return x_gasbase
-    # self.x_gasbase 的形状仍然是 (24, 18)
-
-
-def train_epoch(model,train_loader,optimizer,criterion,device,epoch,x_gasbase):
+def train_epoch(model,train_loader,optimizer,criterion,device,epoch,x_gasbase,attention_criterion):
     model.train()
     train_loss=0.0
     total_correct = 0
@@ -64,8 +40,11 @@ def train_epoch(model,train_loader,optimizer,criterion,device,epoch,x_gasbase):
         data=data.to(device)
         label=label.to(device)
         optimizer.zero_grad()
-        output,_=model(data,x_gasbase)
-        loss=criterion(output,label)
+        output,attn_weights=model(data,x_gasbase)
+        target_attention = F.one_hot(label, num_classes=24).float().to(device)
+        attn_loss = attention_criterion(attn_weights.squeeze(1), target_attention)
+        cls_loss=criterion(output,label)
+        loss=cls_loss + attn_ratio * attn_loss
         loss.backward()
         optimizer.step()
         current_loss=loss.detach().item()
@@ -75,13 +54,15 @@ def train_epoch(model,train_loader,optimizer,criterion,device,epoch,x_gasbase):
         total_samples += total
         progress_bar.set_postfix({
             "loss": f"{current_loss:.4f}",
+            "cls_loss": f"{cls_loss.item():.4f}",
+            "attn_loss": f"{attn_loss.item():.4f}"
         })
         progress_bar.update()
     progress_bar.close()
     
     return train_loss/len(train_loader) ,total_correct / total_samples
 
-def evaluate(model,val_loader,criterion,device,x_gasbase):
+def evaluate(model,val_loader,criterion,device,x_gasbase,attention_criterion):
     total_loss=0
     total_correct = 0
     total_samples = 0
@@ -97,8 +78,11 @@ def evaluate(model,val_loader,criterion,device,x_gasbase):
         for data,label in val_loader:
             data=data.to(device)
             label=label.to(device)
-            output,__annotations__=model(data,x_gasbase)
-            loss=criterion(output,label)
+            output,attn_weights=model(data,x_gasbase)
+            target_attention = F.one_hot(label, num_classes=24).float().to(device)
+            attn_loss = attention_criterion(attn_weights.squeeze(1), target_attention)
+            cls_loss=criterion(output,label)
+            loss=cls_loss + attn_ratio * attn_loss
             current_loss=loss.detach().item()
             total_loss+=current_loss
             correct, total = calculate_accuracy(output, label)
@@ -132,14 +116,15 @@ def main():
     x_gasbase=get_gasbase(gasbase_csv_path)
     x_gasbase=x_gasbase.to(device)
     #模型
-    model=Gas_class_module(in_chans=18, embed_dim=256, hidden_features=128, num_heads=8, attn_drop=0, drop=0.)
+    model=Gas_class_module(in_chans=17, embed_dim=256, hidden_features=128, num_heads=8, attn_drop=DROP, drop=0.2)
     model = model.to(device)
     logging.info(f"模型已加载到设备: {device}")
-    optimizer = torch.optim.AdamW(model.parameters(),lr=1e-4,weight_decay=1e-2)
+    optimizer = torch.optim.AdamW(model.parameters(),lr=LR,weight_decay=W_D)
     warmup = LinearLR(optimizer, start_factor=0.1, total_iters=5)
-    cosine  = CosineAnnealingLR(optimizer, T_max=15, eta_min=1e-6)
+    cosine  = CosineAnnealingLR(optimizer, T_max=25, eta_min=1e-6)
     scheduler = SequentialLR(optimizer, [warmup, cosine], [5])
     criterion =nn.CrossEntropyLoss()
+    attention_criterion = nn.MSELoss()
     #看总参数
     total_params=sum(p.numel() for p in model.parameters())
     logging.info(f"Total parameters: {total_params}")
@@ -156,8 +141,8 @@ def main():
     logging.info("========== 开始新的训练任务 ==========")
     for epoch in range(epochs):
         logging.info(f"轮次{epoch+1}/{epochs}开始训练")
-        train_loss,train_acc=train_epoch(model,train_loader,optimizer,criterion,device,epoch,x_gasbase)
-        val_loss,val_acc=evaluate(model,val_loader,criterion,device,x_gasbase)
+        train_loss,train_acc=train_epoch(model,train_loader,optimizer,criterion,device,epoch,x_gasbase,attention_criterion)
+        val_loss,val_acc=evaluate(model,val_loader,criterion,device,x_gasbase,attention_criterion)
         scheduler.step()
         history['train_loss'].append(train_loss)
         history['train_acc'].append(train_acc)
@@ -183,7 +168,7 @@ def main():
                 logging.info(f"早停: 验证损失连续{patience}轮没有下降")
                 break
     logging.info("训练完成，开始测试集评估")
-    test_loss,test_acc=evaluate(model,test_loader,criterion,device,x_gasbase)
+    test_loss,test_acc=evaluate(model,test_loader,criterion,device,x_gasbase,attention_criterion)
     loss_str = f"{best_val_loss:.3f}".replace('.', 'p')
     final_model_path=os.path.join('./out_model',f'final_model--loss{loss_str}.pth')
     shutil.copy2(best_model_path, final_model_path)
